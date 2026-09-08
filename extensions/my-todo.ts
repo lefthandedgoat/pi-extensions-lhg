@@ -2,7 +2,8 @@
  * my-todo — a personal todo list for YOU (the human), not the agent.
  *
  * Two scopes, both stored as plain human-editable JSON files:
- *   - global  ~/.pi/agent/my-todo/todos.json   (day-to-day + life)
+ *   - global  ~/projects/pi-extensions-lhg-private/todos.json   (day-to-day + life)
+ *     (falls back to ~/.pi/agent/my-todo/todos.json when the private repo is absent)
  *   - project <cwd>/.pi/my-todo/todos.json     (per-project: db, api, …)
  *
  * - `/myday` opens an interactive TUI panel (navigate, add, edit,
@@ -22,7 +23,13 @@ import {
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	writeFileSync,
+} from "node:fs";
 import { Type } from "typebox";
 
 type Scope = "global" | "project";
@@ -44,26 +51,64 @@ const emptyStore = (): MyTodoStore => ({ nextId: 1, items: [] });
 
 // ---------------------------------------------------------------------------
 // File storage (lazy node:fs so the module stays light until used)
+//
+// Global scope lives in the private data repo so todo contents stay out of
+// the public repo and get git backup. Falls back to the legacy ~/.pi path
+// when the private repo isn't present (e.g. a fresh machine).
 // ---------------------------------------------------------------------------
 
+const PRIVATE_REPO_DIR = "pi-extensions-lhg-private";
+const PRIVATE_TODOS_FILE = "todos.json";
+
+function privateGlobalPath(): string | null {
+	const dir = join(homedir(), "projects", PRIVATE_REPO_DIR);
+	if (!existsSync(dir)) return null;
+	return join(dir, PRIVATE_TODOS_FILE);
+}
+
+function legacyGlobalPath(): string {
+	return join(homedir(), ".pi", "agent", "my-todo", "todos.json");
+}
+
 function storePath(scope: Scope, cwd: string): string {
-	if (scope === "global") return join(homedir(), ".pi", "agent", "my-todo", "todos.json");
+	if (scope === "global") return privateGlobalPath() ?? legacyGlobalPath();
 	return join(cwd, CONFIG_DIR_NAME, "my-todo", "todos.json");
 }
 
-function loadStore(scope: Scope, cwd: string): MyTodoStore {
+function readStoreFile(p: string): MyTodoStore | null {
 	try {
-		const p = storePath(scope, cwd);
-		if (!existsSync(p)) return emptyStore();
+		if (!existsSync(p)) return null;
+		// SAFETY: JSON file is written only by saveStore; validate shape before trusting it.
 		const raw = JSON.parse(readFileSync(p, "utf8")) as Partial<MyTodoStore>;
-		if (!Array.isArray(raw.items)) return emptyStore();
+		if (!Array.isArray(raw.items)) return null;
 		return {
 			nextId: typeof raw.nextId === "number" ? raw.nextId : raw.items.length + 1,
-			items: raw.items.filter((i) => typeof i?.id === "number" && typeof i?.text === "string"),
+			items: raw.items.filter(
+				(i) => typeof i?.id === "number" && typeof i?.text === "string",
+			),
 		};
 	} catch {
-		return emptyStore();
+		return null;
 	}
+}
+
+function loadStore(scope: Scope, cwd: string): MyTodoStore {
+	const p = storePath(scope, cwd);
+	const primary = readStoreFile(p);
+	if (primary) return primary;
+	// One-time migration: private repo selected but empty, legacy file has data.
+	if (scope === "global" && p !== legacyGlobalPath()) {
+		const legacy = readStoreFile(legacyGlobalPath());
+		if (legacy) {
+			try {
+				saveStore(scope, cwd, legacy);
+			} catch {
+				// ignore migration write failures; fall through to legacy content
+			}
+			return legacy;
+		}
+	}
+	return emptyStore();
 }
 
 function saveStore(scope: Scope, cwd: string, store: MyTodoStore): void {
@@ -87,7 +132,9 @@ function addItem(store: MyTodoStore, text: string): MyTodoItem {
 
 function formatList(items: MyTodoItem[]): string {
 	if (items.length === 0) return "No todos";
-	return items.map((t) => `[${t.done ? "x" : " "}] #${t.id}: ${t.text}`).join("\n");
+	return items
+		.map((t) => `[${t.done ? "x" : " "}] #${t.id}: ${t.text}`)
+		.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -192,11 +239,19 @@ class MyDayPanel {
 			return;
 		}
 		if (matchesKey(data, "down") || data === "j" || data === "J") {
-			this.cursor = Math.min(Math.max(0, this.items().length - 1), this.cursor + 1);
+			this.cursor = Math.min(
+				Math.max(0, this.items().length - 1),
+				this.cursor + 1,
+			);
 			this.invalidate();
 			return;
 		}
-		if (matchesKey(data, "tab") || data === "\t" || data === "s" || data === "S") {
+		if (
+			matchesKey(data, "tab") ||
+			data === "\t" ||
+			data === "s" ||
+			data === "S"
+		) {
 			this.scope = this.scope === "global" ? "project" : "global";
 			this.cursor = 0;
 			this.invalidate();
@@ -214,7 +269,12 @@ class MyDayPanel {
 			this.invalidate();
 			return;
 		}
-		if (data === " " || data === "x" || data === "X" || matchesKey(data, "return")) {
+		if (
+			data === " " ||
+			data === "x" ||
+			data === "X" ||
+			matchesKey(data, "return")
+		) {
 			const item = this.items()[this.cursor];
 			if (item) {
 				item.done = !item.done;
@@ -259,23 +319,44 @@ class MyDayPanel {
 		lines.push("");
 		const gCount = this.global.items.filter((t) => !t.done).length;
 		const pCount = this.project.items.filter((t) => !t.done).length;
-		const gLabel = this.scope === "global" ? th.fg("accent", th.bold("[1 Global ●]")) : th.fg("dim", `[1 Global (${gCount})`);
+		const gLabel =
+			this.scope === "global"
+				? th.fg("accent", th.bold("[1 Global ●]"))
+				: th.fg("dim", `[1 Global (${gCount})`);
 		const pLabel =
 			this.scope === "project"
 				? th.fg("accent", th.bold(`[2 ${this.projectName} ●]`))
 				: th.fg("dim", `[2 ${this.projectName} (${pCount})`);
 		const title = ` My day  ${gLabel}  ${pLabel} `;
 		lines.push(
-			truncateToWidth(th.fg("borderMuted", "─".repeat(3)) + title + th.fg("borderMuted", "─".repeat(Math.max(0, width - 12 - this.projectName.length))), width),
+			truncateToWidth(
+				th.fg("borderMuted", "─".repeat(3)) +
+					title +
+					th.fg(
+						"borderMuted",
+						"─".repeat(Math.max(0, width - 12 - this.projectName.length)),
+					),
+				width,
+			),
 		);
 		lines.push("");
 
 		const items = this.items();
 		if (items.length === 0) {
-			lines.push(truncateToWidth(`  ${th.fg("dim", "Nothing here. Press a to add one.")}`, width));
+			lines.push(
+				truncateToWidth(
+					`  ${th.fg("dim", "Nothing here. Press a to add one.")}`,
+					width,
+				),
+			);
 		} else {
 			const done = items.filter((t) => t.done).length;
-			lines.push(truncateToWidth(`  ${th.fg("muted", `${done}/${items.length} done`)}`, width));
+			lines.push(
+				truncateToWidth(
+					`  ${th.fg("muted", `${done}/${items.length} done`)}`,
+					width,
+				),
+			);
 			lines.push("");
 			items.forEach((t, i) => {
 				const cursor = i === this.cursor ? th.fg("accent", "› ") : "  ";
@@ -289,8 +370,15 @@ class MyDayPanel {
 		lines.push("");
 		if (this.mode === "input") {
 			const prompt = this.inputKind === "add" ? "Add" : "Edit";
-			lines.push(truncateToWidth(`  ${th.fg("accent", `${prompt}: `)}${this.buffer}${th.fg("accent", "█")}`, width));
-			lines.push(truncateToWidth(`  ${th.fg("dim", "Enter save · Esc cancel")}`, width));
+			lines.push(
+				truncateToWidth(
+					`  ${th.fg("accent", `${prompt}: `)}${this.buffer}${th.fg("accent", "█")}`,
+					width,
+				),
+			);
+			lines.push(
+				truncateToWidth(`  ${th.fg("dim", "Enter save · Esc cancel")}`, width),
+			);
 		} else {
 			lines.push(
 				truncateToWidth(
@@ -324,6 +412,7 @@ const MyTodoParams = Type.Object({
 });
 
 function resolveCwd(ctx: ExtensionContext): string {
+	// SAFETY: TUI/command contexts carry cwd at runtime; optional access is safe when absent.
 	const maybe = (ctx as { cwd?: string }).cwd;
 	return maybe || process.cwd();
 }
@@ -340,6 +429,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: MyTodoParams,
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			// SAFETY: tool runtime passes an ExtensionContext; resolveCwd tolerates a missing cwd.
 			const cwd = resolveCwd(ctx as unknown as ExtensionContext);
 			const scope: Scope = params.scope ?? "global";
 			const store = loadStore(scope, cwd);
@@ -353,25 +443,40 @@ export default function (pi: ExtensionAPI) {
 					};
 				case "add": {
 					if (!params.text?.trim()) {
-						return { content: [{ type: "text", text: "Error: text required for add" }], details: {} };
+						return {
+							content: [{ type: "text", text: "Error: text required for add" }],
+							details: {},
+						};
 					}
 					const item = addItem(store, params.text.trim());
 					saveStore(scope, cwd, store);
 					return {
-						content: [{ type: "text", text: `Added [${tag}] #${item.id}: ${item.text}` }],
+						content: [
+							{ type: "text", text: `Added [${tag}] #${item.id}: ${item.text}` },
+						],
 						details: { scope, todos: store.items },
 					};
 				}
 				case "toggle": {
 					const item = store.items.find((t) => t.id === params.id);
 					if (!item) {
-						return { content: [{ type: "text", text: `Todo #${params.id} not found in [${tag}]` }], details: {} };
+						return {
+							content: [
+								{ type: "text", text: `Todo #${params.id} not found in [${tag}]` },
+							],
+							details: {},
+						};
 					}
 					item.done = !item.done;
 					item.doneAt = item.done ? new Date().toISOString() : undefined;
 					saveStore(scope, cwd, store);
 					return {
-						content: [{ type: "text", text: `[${tag}] #${item.id} ${item.done ? "done" : "reopened"}` }],
+						content: [
+							{
+								type: "text",
+								text: `[${tag}] #${item.id} ${item.done ? "done" : "reopened"}`,
+							},
+						],
 						details: { scope, todos: store.items },
 					};
 				}
@@ -379,7 +484,12 @@ export default function (pi: ExtensionAPI) {
 					const before = store.items.length;
 					store.items = store.items.filter((t) => t.id !== params.id);
 					if (store.items.length === before) {
-						return { content: [{ type: "text", text: `Todo #${params.id} not found in [${tag}]` }], details: {} };
+						return {
+							content: [
+								{ type: "text", text: `Todo #${params.id} not found in [${tag}]` },
+							],
+							details: {},
+						};
 					}
 					saveStore(scope, cwd, store);
 					return {
@@ -408,7 +518,8 @@ export default function (pi: ExtensionAPI) {
 
 	// /mytodo — quick CLI: add/done/rm/list [-p]
 	pi.registerCommand("mytodo", {
-		description: "Quick personal todos: add <text> | done <id> | rm <id> | list (-p = project)",
+		description:
+			"Quick personal todos: add <text> | done <id> | rm <id> | list (-p = project)",
 		handler: async (args, ctx) => {
 			const cwd = resolveCwd(ctx);
 			const tokens = args.trim().split(/\s+/).filter(Boolean);
@@ -458,7 +569,10 @@ export default function (pi: ExtensionAPI) {
 				item.done = !item.done;
 				item.doneAt = item.done ? new Date().toISOString() : undefined;
 				saveStore(scope, cwd, store);
-				ctx.ui.notify(`[${tag}] #${item.id} ${item.done ? "done ✓" : "reopened"}`, "info");
+				ctx.ui.notify(
+					`[${tag}] #${item.id} ${item.done ? "done ✓" : "reopened"}`,
+					"info",
+				);
 				return;
 			}
 
@@ -480,7 +594,10 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			ctx.ui.notify("Usage: /mytodo add <text> | done <id> | rm <id> | list (-p = project)", "error");
+			ctx.ui.notify(
+				"Usage: /mytodo add <text> | done <id> | rm <id> | list (-p = project)",
+				"error",
+			);
 		},
 	});
 }

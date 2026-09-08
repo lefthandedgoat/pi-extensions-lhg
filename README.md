@@ -7,14 +7,21 @@ private data repo).
 ## Extensions
 
 | File | Commands / Tools | What |
-|------|------------------|------|
+| ------ | ------------------ | ------ |
 | `extensions/my-todo.ts` | `/myday`, `/mytodo`, `my_todo` tool | Personal todo list for **you**, not the agent. Global day-to-day list + per-project lists, interactive TUI panel, agent can read/update on request. |
+| `extensions/current-prompt.ts` | `/context`, footer status | Tab title + footer as `<context> › <label>`: spinner while working, `?` during questions, `✓` idle + `N subagents running`. First prompt requires a working context. |
+| `extensions/jobs.ts` | `job_run`, `job_wait/list/logs/stop` | Background shell jobs with early-exit wait and `::progress` + ETA parsing. Only `job_run` is active until first use. |
+| `extensions/lazy-subagent.ts` | `enable_delegation` | Keeps `subagent/*` tools inactive until one explicit call. Saves schema cost. |
+| `extensions/augment-quiet-recall.ts` | (hook, no commands) | Silent-on-miss Augment recall. Sets `AUGMENT_PI_AUTO_CONTEXT=off`, injects nothing when no memory is relevant. |
+| `extensions/direct-image.ts` | `image_direct` tool | Image gen via OpenRouter `/images/generations` endpoint for image-only models. Returns path only, never inlines bytes. |
 
 ### my-todo
 
 Two scopes, stored as plain human-editable JSON:
 
-- Global → `~/.pi/agent/my-todo/todos.json` (day-to-day + life)
+- Global → `~/projects/pi-extensions-lhg-private/todos.json` (day-to-day + life,
+  backed up in the private repo; falls back to `~/.pi/agent/my-todo/todos.json`
+  when the private repo isn't checked out)
 - Project → `<repo>/.pi/my-todo/todos.json` (per-project)
 
 `/myday` opens the interactive panel (`a` add · `e` edit · `space` done ·
@@ -25,8 +32,10 @@ Two scopes, stored as plain human-editable JSON:
 ## Install
 
 ```bash
-git clone git@github.com:lefthandedgoat/pi-extensions-lhg.git ~/pi-extensions-lhg  # or wherever
-ln -s ~/projects/pi-extensions-lhg/extensions/my-todo.ts ~/.pi/agent/extensions/my-todo.ts
+git clone git@github.com:lefthandedgoat/pi-extensions-lhg.git ~/projects/pi-extensions-lhg  # or wherever
+for f in my-todo current-prompt jobs lazy-subagent augment-quiet-recall direct-image; do
+  ln -sf ~/projects/pi-extensions-lhg/extensions/$f.ts ~/.pi/agent/extensions/$f.ts
+done
 ```
 
 Then `/reload` in Pi. Symlinking (instead of copying) means `git pull` updates
