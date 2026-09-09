@@ -158,7 +158,9 @@ function resolveScope(
 			// One-time migration: old per-cwd project file (<cwd>/.pi/my-todo/todos.json).
 			// Only for the project named after this directory — never seed other names.
 			if (name === basename(cwd)) {
-				const legacy = readStoreFile(join(cwd, CONFIG_DIR_NAME, "my-todo", "todos.json"));
+				const legacy = readStoreFile(
+					join(cwd, CONFIG_DIR_NAME, "my-todo", "todos.json"),
+				);
 				if (legacy && legacy.items.length > 0) {
 					all[name] = legacy;
 					try {
@@ -179,7 +181,9 @@ function resolveScope(
 	};
 }
 
-function listProjectNames(cwd: string): Array<{ name: string; open: number; total: number }> {
+function listProjectNames(
+	cwd: string,
+): Array<{ name: string; open: number; total: number }> {
 	const all = loadProjects(cwd);
 	return Object.entries(all)
 		.map(([name, s]) => ({
@@ -284,7 +288,10 @@ class MyDayPanel {
 	private refreshScopes(): void {
 		const names = listProjectNames(this.cwd).map((p) => p.name);
 		const cwdName = basename(this.cwd);
-		this.scopes = ["global", ...names];
+		// Archive is the attic: always last, never in the way.
+		const ordered = names.filter((n) => n !== "archive");
+		if (names.includes("archive")) ordered.push("archive");
+		this.scopes = ["global", ...ordered];
 		if (!names.includes(cwdName)) this.scopes.push(cwdName);
 		const cur = this.scope();
 		const at = this.scopes.indexOf(cur);
@@ -515,7 +522,11 @@ class MyDayPanel {
 		lines.push("");
 		if (this.mode === "input") {
 			const prompt =
-				this.inputKind === "project" ? "New project" : this.inputKind === "add" ? "Add" : "Edit";
+				this.inputKind === "project"
+					? "New project"
+					: this.inputKind === "add"
+						? "Add"
+						: "Edit";
 			lines.push(
 				truncateToWidth(
 					`  ${th.fg("accent", `${prompt}: `)}${this.buffer}${th.fg("accent", "█")}`,
@@ -551,11 +562,25 @@ class MyDayPanel {
 // ---------------------------------------------------------------------------
 
 const MyTodoParams = Type.Object({
-	scope: Type.Optional(Type.String({
-		description: 'Scope: "global" or a project name ("project" = current-directory project)',
-	})),
-	action: StringEnum(["list", "add", "toggle", "delete", "projects", "delete-project"] as const),
-	text: Type.Optional(Type.String({ description: "Todo text (for add), or project name (for delete-project)" })),
+	scope: Type.Optional(
+		Type.String({
+			description:
+				'Scope: "global" or a project name ("project" = current-directory project)',
+		}),
+	),
+	action: StringEnum([
+		"list",
+		"add",
+		"toggle",
+		"delete",
+		"projects",
+		"delete-project",
+	] as const),
+	text: Type.Optional(
+		Type.String({
+			description: "Todo text (for add), or project name (for delete-project)",
+		}),
+	),
 	id: Type.Optional(Type.Number({ description: "Todo ID (for toggle/delete)" })),
 });
 
@@ -573,7 +598,7 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Manage the HUMAN's personal todo list (tickets, env fixes, follow-ups). " +
 			"Scopes: global (day-to-day/life) or a named project (adding to a new name creates it; " +
-			"\"project\" means the current-directory project). " +
+			'"project" means the current-directory project). ' +
 			"Actions: list, add (text), toggle (id), delete (id), projects (list them), " +
 			"delete-project (text = project name).",
 		parameters: MyTodoParams,
@@ -587,7 +612,9 @@ export default function (pi: ExtensionAPI) {
 				const text =
 					names.length === 0
 						? "No projects yet — add a todo with a new scope name to create one."
-						: names.map((p) => `- ${p.name} (${p.open} open / ${p.total} total)`).join("\n");
+						: names
+								.map((p) => `- ${p.name} (${p.open} open / ${p.total} total)`)
+								.join("\n");
 				return {
 					content: [{ type: "text", text }],
 					details: { projects: names },
@@ -598,7 +625,9 @@ export default function (pi: ExtensionAPI) {
 				const name = (params.text ?? "").trim();
 				if (!name || name === "global") {
 					return {
-						content: [{ type: "text", text: "Error: text must name a project to delete" }],
+						content: [
+							{ type: "text", text: "Error: text must name a project to delete" },
+						],
 						details: {},
 					};
 				}
@@ -717,7 +746,12 @@ export default function (pi: ExtensionAPI) {
 				const t = tokens[i];
 				if (t === "-p" || t === "--project") {
 					const next = tokens[i + 1];
-					if (next && !"add done toggle rm delete list projects rmproject".split(" ").includes(next)) {
+					if (
+						next &&
+						!"add done toggle rm delete list projects rmproject"
+							.split(" ")
+							.includes(next)
+					) {
 						scopeName = next;
 						i++;
 					} else {
@@ -732,14 +766,17 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 			const [sub, ...tail] = rest;
-			const usage = "/mytodo add <text> | done <id> | rm <id> | list | projects | rmproject <name> (-p [<name>])";
+			const usage =
+				"/mytodo add <text> | done <id> | rm <id> | list | projects | rmproject <name> (-p [<name>])";
 
 			if (sub === "projects") {
 				const names = listProjectNames(cwd);
 				ctx.ui.notify(
 					names.length === 0
 						? "No projects yet."
-						: names.map((p) => `- ${p.name} (${p.open} open / ${p.total} total)`).join("\n"),
+						: names
+								.map((p) => `- ${p.name} (${p.open} open / ${p.total} total)`)
+								.join("\n"),
 					"info",
 				);
 				return;
