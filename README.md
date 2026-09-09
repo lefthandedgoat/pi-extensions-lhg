@@ -9,7 +9,7 @@ private data repo).
 | File | Commands / Tools | What |
 | ------ | ------------------ | ------ |
 | `extensions/my-todo.ts` | `/myday`, `/mytodo`, `my_todo` tool | Personal todo list for **you**, not the agent. Global day-to-day list + per-project lists, interactive TUI panel, agent can read/update on request. |
-| `extensions/current-prompt.ts` | `/context`, footer status | Tab title + footer as `<context> › <label>`: spinner while working, `?` during questions, `✓` idle + `N subagents running`. First prompt requires a working context. |
+| `extensions/current-prompt.ts` | `/context`, footer status | Tab title + footer as `<context> › <label>`: spinner while working, `?` during questions, `✓` idle + `N subagents/jobs running`. First prompt requires a working context. Idle state stays watched (confirmed-zero + slow rescan) so background work re-arms the spinner instead of wedging the ✓. |
 | `extensions/jobs.ts` | `job_run`, `job_wait/list/logs/stop` | Background shell jobs with early-exit wait and `::progress` + ETA parsing. Only `job_run` is active until first use. |
 | `extensions/lazy-subagent.ts` | `enable_delegation` | Keeps `subagent/*` tools inactive until one explicit call. Saves schema cost. |
 | `extensions/augment-quiet-recall.ts` | (hook, no commands) | Silent-on-miss Augment recall. Sets `AUGMENT_PI_AUTO_CONTEXT=off`, injects nothing when no memory is relevant. |

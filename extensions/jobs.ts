@@ -10,6 +10,12 @@
 // moment a job_run call actually creates a job. That cuts baseline tool-schema
 // cost from 5 tools to 1 for sessions that never background anything.
 //
+// Footer contract: the running-job count is published on globalThis
+// (__piJobsRunning) on every transition, so the current-prompt extension can
+// keep its spinner up while background jobs outlive the agent run. In-process
+// only, same-process extensions — no disk I/O, and a missing reader (or a
+// missing publisher) just means the footer doesn't reflect jobs.
+//
 // Install anywhere: ~/.pi/agent/extensions/jobs.ts (global) or
 // <project>/.pi/extensions/jobs.ts (project-local). A project-local copy never
 // double-registers when a global copy also exists (global wins — see the guard
@@ -238,6 +244,21 @@ export default function (pi: ExtensionAPI) {
 			pi.setActiveTools([...new Set([...active, ...missing])]);
 	}
 
+	// Publish the live running-job count for same-process readers (the
+	// current-prompt footer keeps its spinner up while jobs outlive the run).
+	// Best-effort: footer accuracy must never break job management.
+	function publishRunning() {
+		try {
+			let running = 0;
+			for (const job of jobs.values()) {
+				if (job.status === "running") running++;
+			}
+			(globalThis as any).__piJobsRunning = running;
+		} catch {
+			// ignore — footer hint only
+		}
+	}
+
 	function finalize(
 		job: Job,
 		status: Job["status"],
@@ -254,6 +275,7 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			// already closed
 		}
+		publishRunning();
 	}
 
 	function pushLine(job: Job, line: string) {
@@ -344,6 +366,7 @@ export default function (pi: ExtensionAPI) {
 				lineListeners: new Set(),
 			};
 			jobs.set(id, job);
+			publishRunning();
 			if (child.stdout) attachStream(job, child.stdout);
 			if (child.stderr) attachStream(job, child.stderr);
 			child.on("close", (code: number | null, signal: string | null) => {
@@ -582,6 +605,7 @@ export default function (pi: ExtensionAPI) {
 				// The close handler labeled the killed process "error", but the
 				// exit was user-initiated — "stopped" is the truthful label.
 				job.status = "stopped";
+				publishRunning();
 			}
 			return text(`Job #${params.id} stopped${sigkill ? " (SIGKILL)" : ""}.`);
 		},

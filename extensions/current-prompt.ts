@@ -8,13 +8,20 @@
 //
 // Renders `<state> <context> › <label>` to the terminal title and the pi footer
 // status (key "current-prompt"): a braille spinner while working, `?` while
-// ask_user_question awaits an answer, `✓` when idle. When background subagents
-// (via pi-subagents) are still running after the main agent settles, a
-// warning-colored spinner with "N subagents running" continues instead of the ✓.
+// ask_user_question awaits an answer, `✓` when idle. When background work —
+// async subagents (via pi-subagents) or background jobs (via jobs.ts) — is
+// still running after the main agent settles, a warning-colored spinner with
+// "N subagents running" / "N jobs running" continues instead of the ✓.
+//
+// The idle state is never unwatched: a fast poll confirms background work is
+// really gone (consecutive zero-scans) before showing the ✓, and a slow watch
+// keeps re-scanning while idle so late-spawning work re-arms the spinner
+// instead of wedging the ✓ forever.
 //
 // Subagent awareness reads pi-subagents' on-disk contract directly (it does NOT
 // import pi-subagents internals — that would be version-fragile and side-effect
-// the whole extension).
+// the whole extension). Job awareness reads jobs.ts' in-process running count
+// (globalThis.__piJobsRunning) — same-process extensions, no disk I/O.
 //
 // Install anywhere: ~/.pi/agent/extensions/current-prompt.ts (global) or
 // <project>/.pi/extensions/current-prompt.ts (project-local); the global copy
@@ -39,6 +46,24 @@ const SEP = " › ";
 const SUBAGENT_FRAME_MS = 120;
 const SUBAGENT_SCAN_MS = 1200;
 const SUBAGENT_STALE_MS = 6 * 60 * 60 * 1000;
+// Slow re-scan while the footer claims idle: catches work that spawns after the
+// ✓ is already shown. Cheap (one dir listing) — must stay unref'd, like the rest.
+const IDLE_WATCH_MS = 2000;
+// A lone zero scan proves nothing (mid-spawn status.json gap, torn dir listing)
+// — only settle to ✓ after this many consecutive zero scans.
+const IDLE_ZERO_CONFIRM = 2;
+// pi-subagents' own terminal set (see its stale-run-reconciler) plus
+// "completed" (sibling status shapes). Anything else — including a missing or
+// future-unknown state — counts as active: fail to the spinner, never to the ✓.
+const TERMINAL_SUBAGENT_STATES = new Set([
+	"complete",
+	"completed",
+	"failed",
+	"partial",
+	"paused",
+	"stopped",
+	"rejected",
+]);
 
 const SUMMARY_INSTRUCTION =
 	"Summarize the following user request as a terse task label of 3-7 words. Respond with ONLY the label: no quotes, no punctuation at the end, no preamble.\n\nRequest:\n";
@@ -113,18 +138,36 @@ function pidIsAlive(pid: number): boolean {
 	}
 }
 
-function countActiveSubagents(sessionIds: string[]): number {
+interface BackgroundCount {
+	subagents: number;
+	jobs: number;
+}
+
+function countRunningJobs(): number {
 	try {
-		if (sessionIds.length === 0) return 0; // can't attribute ownership, don't guess
-		const owned = new Set(sessionIds.map(normSessionId));
+		const n = (globalThis as any).__piJobsRunning;
+		return typeof n === "number" && n > 0 ? Math.floor(n) : 0;
+	} catch {
+		return 0; // jobs.ts absent — subagents alone still drive the footer
+	}
+}
+
+// null = the scan failed outright and proved nothing. Callers hold the previous
+// frame and do NOT advance the idle zero-streak — a scan glitch must never wedge a ✓.
+function scanBackground(sessionIds: string[]): BackgroundCount | null {
+	let subagents = 0;
+	try {
+		// Without session ids ownership can't be attributed, so subagents stay
+		// uncounted — same-process jobs need no attribution and still count.
+		const owned =
+			sessionIds.length > 0 ? new Set(sessionIds.map(normSessionId)) : null;
 		const { runs, results } = subagentDirs();
 		let entries: fs.Dirent[];
 		try {
 			entries = fs.readdirSync(runs, { withFileTypes: true });
 		} catch {
-			return 0;
+			return null; // unreadable dir tells us nothing — never fail to ✓
 		}
-		let count = 0;
 		for (const entry of entries) {
 			try {
 				if (!entry.isDirectory()) continue;
@@ -143,8 +186,15 @@ function countActiveSubagents(sessionIds: string[]): number {
 					runId?: unknown;
 					pid?: unknown;
 				};
-				if (status.state !== "running" && status.state !== "queued") continue;
 				if (
+					typeof status.state === "string" &&
+					TERMINAL_SUBAGENT_STATES.has(status.state)
+				)
+					continue;
+				// Missing/unknown state counts as active: a future pi-subagents
+				// state must fail to the spinner, never to the ✓.
+				if (
+					owned === null ||
 					typeof status.sessionId !== "string" ||
 					!owned.has(normSessionId(status.sessionId))
 				)
@@ -155,13 +205,13 @@ function countActiveSubagents(sessionIds: string[]): number {
 						: entry.name;
 				if (fs.existsSync(path.join(results, `${runId}.json`))) continue; // already finished
 				if (typeof status.pid === "number" && !pidIsAlive(status.pid)) continue;
-				count++;
+				subagents++;
 			} catch {}
 		}
-		return count;
 	} catch {
-		return 0; // a scan glitch can never wedge a spinner — fail to the ✓
+		return null; // a scan glitch proves nothing — never fail to the ✓
 	}
+	return { subagents, jobs: countRunningJobs() };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -207,7 +257,10 @@ export default function (pi: ExtensionAPI) {
 	let frameIdx = 0;
 	let summaryAbort: AbortController | null = null;
 	let activeSubagents = 0;
+	let activeJobs = 0;
 	let lastSubagentScanAt = 0;
+	let idleZeroStreak = 0;
+	let idleWatchTimer: NodeJS.Timeout | null = null;
 	const activeQuestionToolCalls = new Set<string>();
 
 	// --- context capture & persistence ---------------------------------------
@@ -304,13 +357,20 @@ export default function (pi: ExtensionAPI) {
 		return theme.fg("accent", currentContext) + theme.fg("dim", SEP) + label;
 	}
 
-	function subagentCore(
-		ctx: ExtensionContext,
-		themed: boolean,
-		count: number,
-	): string {
+	function backgroundLabel(): string {
+		const parts: string[] = [];
+		if (activeSubagents > 0)
+			parts.push(
+				`${activeSubagents} subagent${activeSubagents === 1 ? "" : "s"} running`,
+			);
+		if (activeJobs > 0)
+			parts.push(`${activeJobs} job${activeJobs === 1 ? "" : "s"} running`);
+		return parts.join(" · ") || "working";
+	}
+
+	function backgroundCore(ctx: ExtensionContext, themed: boolean): string {
 		const theme = (ctx.ui as any).theme;
-		const label = `${count} subagent${count === 1 ? "" : "s"} running`;
+		const label = backgroundLabel();
 		if (!themed)
 			return currentContext ? `${currentContext}${SEP}${label}` : label;
 		const styledLabel = theme.fg("warning", label);
@@ -353,7 +413,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function showQuestion(ctx: ExtensionContext) {
-		stopIdlePoll();
+		stopBackground();
 		stopSpinner();
 		if (!ctx.hasUI) return;
 		try {
@@ -382,65 +442,121 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	function stopSlowWatch() {
+		if (idleWatchTimer) {
+			clearInterval(idleWatchTimer);
+			idleWatchTimer = null;
+		}
+	}
+
+	function stopBackground() {
+		stopIdlePoll();
+		stopSlowWatch();
+	}
+
 	function startSpinner(ctx: ExtensionContext) {
 		if (activeQuestionToolCalls.size > 0) {
 			showQuestion(ctx);
 			return;
 		}
 		if (!ctx.hasUI) return;
-		stopIdlePoll();
+		stopBackground();
 		stopSpinner();
 		paint(ctx);
 		timer = setInterval(() => paint(ctx), 80);
 		(timer as any)?.unref?.();
 	}
 
-	function paintSubagentIdle(ctx: ExtensionContext) {
+	function paintBackgroundIdle(ctx: ExtensionContext) {
 		if (!ctx.hasUI) return;
 		try {
 			const now = Date.now();
 			if (now - lastSubagentScanAt >= SUBAGENT_SCAN_MS) {
-				activeSubagents = countActiveSubagents(currentSessionIds(ctx));
 				lastSubagentScanAt = now;
-			}
-			if (activeSubagents <= 0) {
-				stopIdlePoll();
-				showCheck(ctx);
-				return;
+				const found = scanBackground(currentSessionIds(ctx));
+				if (found && found.subagents + found.jobs > 0) {
+					// Fresh evidence of work: reset the streak, repaint at once.
+					idleZeroStreak = 0;
+					activeSubagents = found.subagents;
+					activeJobs = found.jobs;
+				} else if (found) {
+					// A lone zero scan proves nothing (mid-spawn status.json
+					// gap, torn dir listing) — settle only after consecutive zeros.
+					idleZeroStreak++;
+					if (idleZeroStreak >= IDLE_ZERO_CONFIRM) {
+						activeSubagents = 0;
+						activeJobs = 0;
+						stopIdlePoll();
+						showCheck(ctx);
+						startSlowWatch(ctx);
+						return;
+					}
+					// Otherwise keep the previous label + spinner this tick.
+				}
+				// found === null: the scan told us nothing — hold the last frame.
 			}
 			const frame = SPINNER[frameIdx++ % SPINNER.length];
 			const theme = (ctx.ui as any).theme;
-			ctx.ui.setTitle(`${frame} ${subagentCore(ctx, false, activeSubagents)}`);
+			ctx.ui.setTitle(`${frame} ${backgroundCore(ctx, false)}`);
 			ctx.ui.setStatus(
 				STATUS_KEY,
-				`${theme.fg("warning", frame)} ${subagentCore(ctx, true, activeSubagents)}`,
+				`${theme.fg("warning", frame)} ${backgroundCore(ctx, true)}`,
 			);
 		} catch {
 			// ignore
 		}
 	}
 
+	function startSlowWatch(ctx: ExtensionContext) {
+		// Last line of defence against the stuck ✓: while the footer claims
+		// idle, re-scan cheaply. Work that spawns after the ✓ is already shown
+		// re-arms the spinner within IDLE_WATCH_MS instead of wedging the ✓.
+		if (!ctx.hasUI || idleWatchTimer) return;
+		stopIdlePoll();
+		idleWatchTimer = setInterval(() => {
+			try {
+				if (timer || idleTimer || activeQuestionToolCalls.size > 0) return;
+				const found = scanBackground(currentSessionIds(ctx));
+				if (found && found.subagents + found.jobs > 0) enterIdle(ctx);
+			} catch {
+				// a watch glitch must never touch the footer
+			}
+		}, IDLE_WATCH_MS);
+		(idleWatchTimer as any)?.unref?.();
+	}
+
 	function startIdlePoll(ctx: ExtensionContext) {
 		if (!ctx.hasUI) return;
+		stopSlowWatch();
 		stopIdlePoll();
-		paintSubagentIdle(ctx);
-		idleTimer = setInterval(() => paintSubagentIdle(ctx), SUBAGENT_FRAME_MS);
+		paintBackgroundIdle(ctx);
+		idleTimer = setInterval(() => paintBackgroundIdle(ctx), SUBAGENT_FRAME_MS);
 		(idleTimer as any)?.unref?.();
 	}
 
 	function enterIdle(ctx: ExtensionContext) {
 		stopSpinner();
+		stopSlowWatch();
 		if (!ctx.hasUI) return;
 		if (activeQuestionToolCalls.size > 0) {
 			showQuestion(ctx);
 			return;
 		}
-		activeSubagents = countActiveSubagents(currentSessionIds(ctx));
+		const found = scanBackground(currentSessionIds(ctx));
 		lastSubagentScanAt = Date.now();
-		if (activeSubagents > 0) startIdlePoll(ctx);
-		else {
+		idleZeroStreak = 0;
+		if (found && found.subagents + found.jobs > 0) {
+			activeSubagents = found.subagents;
+			activeJobs = found.jobs;
+			startIdlePoll(ctx);
+		} else {
+			// found === null (unreadable scan) also lands here: show the ✓
+			// but keep the slow watch running so real work re-arms the spinner.
+			activeSubagents = 0;
+			activeJobs = 0;
 			stopIdlePoll();
 			showCheck(ctx);
+			startSlowWatch(ctx);
 		}
 	}
 
@@ -579,7 +695,7 @@ export default function (pi: ExtensionAPI) {
 		summaryAbort = null;
 		activeQuestionToolCalls.clear();
 		stopSpinner();
-		stopIdlePoll();
+		stopBackground();
 	});
 
 	pi.registerCommand("context", {
