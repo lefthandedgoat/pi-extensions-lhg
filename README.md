@@ -40,3 +40,9 @@ done
 
 Then `/reload` in Pi. Symlinking (instead of copying) means `git pull` updates
 your running Pi extensions directly.
+
+## Docs
+
+- [`docs/low-cpu-vdi.md`](docs/low-cpu-vdi.md) — running pi on a CPU-starved
+  Citrix VDI with no GPU: measured frame rates, the `current-prompt`
+  repaint fix, and pi / Windows Terminal / Citrix settings worth trying.
