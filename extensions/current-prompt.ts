@@ -38,6 +38,10 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+// Static glyph for the footer status. That channel force-repaints the TUI
+// (ui.requestRender, no diffing), so it must not change every tick; the
+// animated frame goes on the tab title, which is a cheap OSC write.
+const STATIC_MARK = SPINNER[0];
 const MAX_LEN = 100;
 const CONTEXT_MAX_LEN = 60;
 const SUMMARIZE_MIN_LEN = 80;
@@ -255,6 +259,9 @@ export default function (pi: ExtensionAPI) {
 	let timer: NodeJS.Timeout | null = null;
 	let idleTimer: NodeJS.Timeout | null = null;
 	let frameIdx = 0;
+	// Last string written to the footer status, so spinner ticks that only
+	// change the glyph don't force a repaint. See setStatusIfChanged.
+	let lastStatus: string | null = null;
 	let summaryAbort: AbortController | null = null;
 	let activeSubagents = 0;
 	let activeJobs = 0;
@@ -380,6 +387,15 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
+	// The footer status channel calls ui.requestRender() with no diffing, so a
+	// spinner tick that only changed one glyph used to cost a full TUI frame
+	// (~12.5/sec while busy). Only write when the rendered line actually changes.
+	function setStatusIfChanged(ctx: ExtensionContext, text: string) {
+		if (lastStatus === text) return;
+		lastStatus = text;
+		ctx.ui.setStatus(STATUS_KEY, text);
+	}
+
 	function paint(ctx: ExtensionContext) {
 		if (!ctx.hasUI) return;
 		try {
@@ -389,9 +405,9 @@ export default function (pi: ExtensionAPI) {
 			const frame = SPINNER[frameIdx++ % SPINNER.length];
 			const theme = (ctx.ui as any).theme;
 			ctx.ui.setTitle(`${frame} ${core(ctx, false)}`);
-			ctx.ui.setStatus(
-				STATUS_KEY,
-				`${theme.fg("accent", frame)} ${core(ctx, true)}`,
+			setStatusIfChanged(
+				ctx,
+				`${theme.fg("accent", STATIC_MARK)} ${core(ctx, true)}`,
 			);
 		} catch {
 			// rendering must never break the turn
@@ -403,8 +419,8 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const theme = (ctx.ui as any).theme;
 			ctx.ui.setTitle(`✓ ${core(ctx, false)}`);
-			ctx.ui.setStatus(
-				STATUS_KEY,
+			setStatusIfChanged(
+				ctx,
 				`${theme.fg("success", "✓")} ${core(ctx, true)}`,
 			);
 		} catch {
@@ -419,8 +435,8 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const theme = (ctx.ui as any).theme;
 			ctx.ui.setTitle(`? ${core(ctx, false)}`);
-			ctx.ui.setStatus(
-				STATUS_KEY,
+			setStatusIfChanged(
+				ctx,
 				`${theme.fg("warning", "?")} ${core(ctx, true)}`,
 			);
 		} catch {
@@ -498,9 +514,9 @@ export default function (pi: ExtensionAPI) {
 			const frame = SPINNER[frameIdx++ % SPINNER.length];
 			const theme = (ctx.ui as any).theme;
 			ctx.ui.setTitle(`${frame} ${backgroundCore(ctx, false)}`);
-			ctx.ui.setStatus(
-				STATUS_KEY,
-				`${theme.fg("warning", frame)} ${backgroundCore(ctx, true)}`,
+			setStatusIfChanged(
+				ctx,
+				`${theme.fg("warning", STATIC_MARK)} ${backgroundCore(ctx, true)}`,
 			);
 		} catch {
 			// ignore
@@ -696,6 +712,7 @@ export default function (pi: ExtensionAPI) {
 		activeQuestionToolCalls.clear();
 		stopSpinner();
 		stopBackground();
+		lastStatus = null; // force the next footer write through
 	});
 
 	pi.registerCommand("context", {
